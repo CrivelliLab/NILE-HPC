@@ -43,8 +43,9 @@ if __name__ == "__main__":
         print(json.dumps(parsed, indent=4, sort_keys=True))
 
         #- Broadcast ETL (Extract, Transform, Load) Across Workers
-        for i, worker in enumerate(nlp._workers):
-            query_ = query.format(workers=len(nlp._workers),wid=i)
+        workers = nlp.get_workers()
+        for i, worker in enumerate(workers):
+            query_ = query.format(workers=len(workers),wid=i)
             nlp.etl(query_, to_table, xcol="text", uid_cols=["tid"] ,rank=worker)
         nlp.barrier()
 
