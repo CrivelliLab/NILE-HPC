@@ -10,6 +10,7 @@
         json
         jpype
         jpype.imports
+        [time [sleep]]
         [mpi4py [MPI]]
         [numpy :as np]
         [pandas :as pd]
@@ -24,33 +25,12 @@
     (setv self._comm (if mpi MPI.COMM_WORLD None)
           self._rank (if mpi (.Get_rank self._comm) 0)
           self._worldsize (if mpi (.Get_size self._comm) 1)
-          self.workers (if mpi (list (range 1 self._worldsize)) [0])
+          self._workers (if mpi (list (range 1 self._worldsize)) [0])
+          self._buf (np.zeros (len self._workers) :dtype "int8")
+          self._win (if mpi (self._init_win) None)
           self._staged None
           self._conn conn
           self._verbose verbose))
-
-  ;--
-  (defn __enter__ [self]
-    (jpype.startJVM)
-    (import [edu.harvard.hsph.biostats.nile [NaturalLanguageProcessor]]
-            [edu.harvard.hsph.biostats.nile [SemanticRole]])
-    (setv self.nlp (NaturalLanguageProcessor)
-          self._observation SemanticRole.OBSERVATION
-          self._modifier SemanticRole.MODIFIER
-          self._mods [])
-    (unless (= self._comm None)
-      (if (= self._rank 0)
-          (self._comm.Barrier)
-          (self._worker_process)))
-    self)
-
-  ;--
-  (defn __exit__ [self e1 e2 e3]
-    (jpype.shutdownJVM)
-    (unless (= self._comm None)
-      (for [i (range 1 self._worldsize)]
-        (let [data {"task" "__exit__"}]
-          (self._comm.send data :dest i :tag 11)))))
 
   ;--
   (defn _parse_SemanticObj [self obj sentence]
@@ -77,34 +57,27 @@
       semobjs))
 
   ;--
-  (defn _flip-active [self wid rank])
+  (defn __enter__ [self]
+    (jpype.startJVM)
+    (import [edu.harvard.hsph.biostats.nile [NaturalLanguageProcessor]]
+            [edu.harvard.hsph.biostats.nile [SemanticRole]])
+    (setv self.nlp (NaturalLanguageProcessor)
+          self._observation SemanticRole.OBSERVATION
+          self._modifier SemanticRole.MODIFIER
+          self._mods [])
+    (unless (= self._comm None)
+      (if (= self._rank 0)
+          (self._comm.Barrier)
+          (self._worker_process)))
+    self)
 
   ;--
-  (defn _worker_process [self]
-    (self._comm.Barrier)
-    (while True
-      (let [data (self._comm.recv :source 0 :tag 11)]
-        (cond
-          [(= (get data "task") "__exit__") (do (jpype.shutdownJVM) (exit))]
-          [(= (get data "task") "add_observation")
-           (self.add-observation (get data "term") (get data "code"))]
-          [(= (get data "task") "add_modifier")
-           (self.add-modifier (get data "term") (get data "code"))]
-          [(= (get data "task") "extract")
-           (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))]
-          [(= (get data "task") "transform")
-           (do (unless (is (get data "df") None) (setv self._staged (get data "df")))
-               (self._tranform_staged (get data "xcol") (get data "uid_cols")))]
-          [(= (get data "task") "load")
-           (self._load_staged (get data "to_table") (get data "if_exists"))]
-          [(= (get data "task") "gather")
-           (let [staged self._staged]
-             (setv self._staged None)
-             (self._comm.send staged :dest 0 :tag 11))]
-          [(= (get data "task") "etl")
-           (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
-               (self._tranform_staged (get data "xcol") (get data "uid_cols"))
-               (self._load_staged (get data "to_table") (get data "if_exists")))]))))
+  (defn __exit__ [self e1 e2 e3]
+    (jpype.shutdownJVM)
+    (unless (= self._comm None)
+      (for [i (range 1 self._worldsize)]
+        (let [data {"task" "__exit__"}]
+          (self._comm.send data :dest i :tag 11)))))
 
   ;--
   (defn add-observation [self term code]
@@ -154,6 +127,7 @@
     (if (| (= self._comm None) (= rank 0))
         (self._extract_staged query xcol uid-cols)
         (let [data {"task" "extract" "query" query "xcol" xcol "uid_cols" uid-cols}]
+          (self._flip_active rank)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -179,6 +153,7 @@
         (do (unless (is df None) (setv self._staged df))
             (self._tranform_staged xcol uid-cols))
         (let [data {"task" "transform" "df" df "xcol" xcol "uid_cols" uid-cols}]
+          (self._flip_active rank)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -193,6 +168,7 @@
     (if (| (= self._comm None) (= rank 0))
         (self._load_staged to_table if-exists)
         (let [data {"task" "load" "to_table" to_table "if_exists" if-exists}]
+          (self._flip_active rank)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -212,4 +188,73 @@
             (self._tranform_staged xcol uid-cols)
             (self._load_staged to_table if-exists))
         (let [data {"task" "etl" "query" query "to_table" to_table "xcol" xcol "uid_cols" uid-cols "if_exists" if-exists}]
-          (self._comm.send data :dest rank :tag 11)))))
+          (self._flip_active rank)
+          (self._comm.send data :dest rank :tag 11))))
+
+  ;--
+  (defn _init_win [self]
+    (let [size (* (len self._workers) (MPI.CHAR.Get_size))
+          win (MPI.Win.Allocate size :comm self._comm)]
+      (when (= self._rank 0)
+        (win.Lock :rank 0)
+        (win.Put self._buf :target-rank 0)
+        (win.Unlock :rank 0))
+      (self._comm.Barrier)
+      win))
+
+  ;--
+  (defn _flip_active [self wid]
+    (let [wid (- wid 1)]
+      (self._win.Lock :rank 0)
+      (self._win.Get self._buf :target-rank 0)
+      (self._win.Unlock :rank 0)
+      (setv (get self._buf wid) (if (= (get self._buf wid) 1) 0 1))
+      (self._win.Lock :rank 0)
+      (self._win.Put self._buf :target-rank 0)
+      (self._win.Unlock :rank 0)))
+
+  ;--
+  (defn _worker_process [self]
+    (self._comm.Barrier)
+    (while True
+      (let [data (self._comm.recv :source 0 :tag 11)]
+        (cond
+          [(= (get data "task") "__exit__") (do (jpype.shutdownJVM) (exit))]
+          [(= (get data "task") "add_observation")
+           (self.add-observation (get data "term") (get data "code"))]
+          [(= (get data "task") "add_modifier")
+           (self.add-modifier (get data "term") (get data "code"))]
+          [(= (get data "task") "extract")
+           (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
+               (self._flip_active self._rank))]
+          [(= (get data "task") "transform")
+           (do (unless (is (get data "df") None) (setv self._staged (get data "df")))
+               (self._tranform_staged (get data "xcol") (get data "uid_cols"))
+               (self._flip_active self._rank))]
+          [(= (get data "task") "load")
+           (do (self._load_staged (get data "to_table") (get data "if_exists"))
+               (self._flip_active self._rank))]
+          [(= (get data "task") "gather")
+           (let [staged self._staged]
+             (setv self._staged None)
+             (self._comm.send staged :dest 0 :tag 11))]
+          [(= (get data "task") "etl")
+           (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
+               (self._tranform_staged (get data "xcol") (get data "uid_cols"))
+               (self._load_staged (get data "to_table") (get data "if_exists"))
+               (self._flip_active self._rank))]))))
+
+  ;--
+  (defn get-workers [self]
+    (if (= self._comm None)
+        {0 0}
+        (do (self._win.Lock :rank 0)
+            (self._win.Get self._buf :target-rank 0)
+            (self._win.Unlock :rank 0)
+            (dfor rank self._workers [rank (get self._buf (- rank 1))]))))
+
+  ;--
+  (defn barrier [self]
+    (while (let [actives (lfor (, rank active) (.items (self.get-workers)) active)]
+              (> (sum actives) 0))
+      (sleep 0.5))))

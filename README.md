@@ -1,5 +1,5 @@
 # NILE-HPC
-Python3 wrapper for NILE with MPI capability
+Python3 wrapper for NILE with MPI capability.
 
 ## Getting Started:
 
