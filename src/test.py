@@ -1,44 +1,59 @@
 # test.py
-# Testing NILE functional wrapper in Python3.
+# Testing NILE wrapper in Python3.
 # Implemented MPI: $ mpirun -n cores python3 test.py
 
 #--
 import json
 import numpy as np
 import pandas as pd
+import sqlite3 as sql
 from nile import NILE
+
+#- SQL Connections
+conn = "data/example.db"
+to_table = "nile"
+query = "SELECT * FROM Documents;"
+
+
+query = """
+SELECT * FROM (
+    SELECT *, ROW_NUMBER() OVER (ORDER BY tid) AS rn FROM Documents
+) T1
+WHERE rn % {workers} = {wid}"""
 
 #--
 if __name__ == "__main__":
 
     #-
-    with NILE(mpi=False) as nlp:
+    with NILE(mpi=False,conn=conn,verbose=False) as nlp:
 
-        #- Load A Lexicon
+        #- Create Database
+        with sql.connect(conn) as db:
+            df = pd.read_csv("data/datasets/example.csv")
+            df.to_sql(name="Documents",if_exists="replace",con=db)
+            try: db.cursor().execute("DROP TABLE {};".format(to_table))
+            except: pass
+
+        #- Load and Add Lexicon to NILE
         lexicon = pd.read_csv("data/lexicons/clever_mods.csv")
         nlp.add_lexicon(lexicon)
+        # nlp.request_lexicon(sql,conn,term_col="term",code_col="code",role_col="role")
 
-        #- Add individual phrases
-        nlp.add_observation("suicide", "SUICIDE")
+        #- Add Individual Phrases
+        nlp.add_observation(term="suicide", code="SUICIDE")
 
-        #- Single Text Example
+        #- Parse Single String
         text = "The mother has a history of suicide. The pt may be at risk for suicide."
         parsed = nlp(text)
         print(json.dumps(parsed, indent=4, sort_keys=True))
 
-        #- DataFrame Example
-        df = pd.DataFrame([(i, text) for i in range(1)], columns=["tid", "text"])
-        dfs = np.array_split(df, len(nlp.workers))
-        outs = []
-
-        #- Broadcast NILE Across Workers
+        #- Broadcast ETL (Extract, Transform, Load) Across Workers
         for i, worker in enumerate(nlp.workers):
-            nlp.transform(dfs[i],xcol="text",uid_cols=["tid"], rank=worker)
+            query_ = query.format(workers=len(nlp.workers),wid=i)
+            nlp.etl(query_, to_table, xcol="text", uid_cols=["tid"] ,rank=worker)
 
-        #- Gather NILE Results From Workers
-        for i, worker in enumerate(nlp.workers):
-            outs.append(nlp.gather(rank=worker))
-
-        #-
-        out = pd.concat(outs)
-        print(out)
+        #- Load NILE Results
+        with sql.connect(conn) as db:
+            results = pd.read_sql("SELECT * FROM {};".format(to_table),db)
+            print(results)
+            print(results.columns)
