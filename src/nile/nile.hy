@@ -286,9 +286,5 @@
   ;--
   (defn barrier [self]
     (let [actives (sum (lfor (, rank active) (.items (self.get-workers)) active))]
-      (while (> actives 1) 
+      (while (> actives 1)
         (setv actives (sum (lfor (, rank active) (.items (self.get-workers)) active)))))))
-    ;; (self._win.Lock :rank 0)
-    ;; (setv self._buf (np.zeros (len self._workers) :dtype "int8"))
-    ;; (self._win.Put self._buf :target-rank 0)
-    ;; (self._win.Unlock :rank 0)))
