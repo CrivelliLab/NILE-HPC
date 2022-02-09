@@ -3,3 +3,5 @@ __pycache__
 NILE.jar
 commit.sh
 *.db
+output/
+dev/
