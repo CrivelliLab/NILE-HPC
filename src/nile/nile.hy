@@ -6,15 +6,15 @@
 (require [hy.contrib.walk [let]])
 
 ;--
-(import os
-        json
+(import os re json
         jpype
         jpype.imports
         [time [sleep]]
         [mpi4py [MPI]]
         [numpy :as np]
         [pandas :as pd]
-        [sqlite3 :as sql])
+        [sqlite3 :as sql]
+        [nltk.tokenize.treebank [TreebankWordTokenizer]])
 (jpype.addClassPath (.format "{}/NILE.jar" (os.path.dirname (os.path.abspath __file__))))
 
 ;--
@@ -30,13 +30,25 @@
           self._win (if mpi (self._init_win) None)
           self._staged None
           self._conn conn
-          self._verbose verbose))
+          self._verbose verbose
+          self._preprocess_regex1 (re.compile r"\s+")
+          self._preprocess_regex2 (re.compile r"(\S+)\s(\S?\'\S+\s)")
+          self._tokenizer (TreebankWordTokenizer)))
+
+  ;--
+  (defn _preprocess-text [self text]
+    (let [value (.lower text)
+          value (.sub self._preprocess_regex1 " " value)
+          tokenized (.tokenize self._tokenizer value)
+          value (.join " " tokenized)
+          value (.sub self._preprocess_regex2 r"\1\2" value)]
+      value))
 
   ;--
   (defn _parse_SemanticObj [self obj sentence]
-    (let [hit {"tokens" (.join ";" (lfor t (.getTokens sentence) (str t)))
+    (let [hit {"tokens" (.join "|" (lfor t (.getTokens sentence) (str t)))
                "role" (str (.getSemanticRole obj))
-               "code" (.join "," (lfor code (.getCode obj) (str code)))
+               "code" (.join ";" (lfor code (.getCode obj) (str code)))
                "term" (str (.getText obj))
                "token_start" (int (.getOffsetStart obj))
                "token_end" (int (.getOffsetEnd obj))
@@ -49,7 +61,8 @@
 
   ;--
   (defn __call__ [self text]
-    (let [sentences (self.nlp.digTextLine text)
+    (let [text-preprocessed (self._preprocess-text text)
+          sentences (self._nlp.digTextLine text-preprocessed)
           semobjs []]
       (for [sent sentences]
         (for [obj (.getSemanticObjs sent)]
@@ -61,7 +74,7 @@
     (jpype.startJVM)
     (import [edu.harvard.hsph.biostats.nile [NaturalLanguageProcessor]]
             [edu.harvard.hsph.biostats.nile [SemanticRole]])
-    (setv self.nlp (NaturalLanguageProcessor)
+    (setv self._nlp (NaturalLanguageProcessor)
           self._observation SemanticRole.OBSERVATION
           self._modifier SemanticRole.MODIFIER
           self._mods [])
@@ -82,7 +95,7 @@
   ;--
   (defn add-observation [self term code]
     (try
-      (self.nlp.addPhrase term code self._observation)
+      (self._nlp.addPhrase term code self._observation)
       (unless (| (= self._comm None) (!= self._rank 0))
         (for [i (range 1 self._worldsize)]
           (let [data {"task" "add_observation" "term" term "code" code}]
@@ -95,7 +108,7 @@
   ;--
   (defn add-modifier [self term code]
     (try
-      (self.nlp.addPhrase term code self._modifier)
+      (self._nlp.addPhrase term code self._modifier)
       (unless (in code self._mods) (.append self._mods code))
       (unless (| (= self._comm None) (!= self._rank 0))
         (for [i (range 1 self._worldsize)]
@@ -127,7 +140,21 @@
     (if (| (= self._comm None) (= rank 0))
         (self._extract_staged query xcol uid-cols)
         (let [data {"task" "extract" "query" query "xcol" xcol "uid_cols" uid-cols}]
-          (self._flip_active rank)
+          (self._set_active rank 1)
+          (self._comm.send data :dest rank :tag 11))))
+
+  ;--
+  (defn _extract-pandas_staged [self pandas xcol uid-cols]
+    (setv self._staged
+          (cond [(.endswith pandas ".csv") (get (pd.read-csv pandas) (+ uid-cols [xcol]))]
+                [(.endswith pandas ".parquet") (get (pd.read-parquet pandas) (+ uid-cols [xcol]))])))
+
+  ;--
+  (defn extract-pandas [self pandas &optional [xcol "text"] [uid-cols ["index"]] [rank 0]]
+    (if (| (= self._comm None) (= rank 0))
+        (self._extract-pandas_staged pandas xcol uid-cols)
+        (let [data {"task" "extract-pandas" "pandas" pandas "xcol" xcol "uid_cols" uid-cols}]
+          (self._set_active rank 1)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -153,7 +180,7 @@
         (do (unless (is df None) (setv self._staged df))
             (self._tranform_staged xcol uid-cols))
         (let [data {"task" "transform" "df" df "xcol" xcol "uid_cols" uid-cols}]
-          (self._flip_active rank)
+          (self._set_active rank 1)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -168,7 +195,7 @@
     (if (| (= self._comm None) (= rank 0))
         (self._load_staged to_table if-exists)
         (let [data {"task" "load" "to_table" to_table "if_exists" if-exists}]
-          (self._flip_active rank)
+          (self._set_active rank 1)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -188,7 +215,7 @@
             (self._tranform_staged xcol uid-cols)
             (self._load_staged to_table if-exists))
         (let [data {"task" "etl" "query" query "to_table" to_table "xcol" xcol "uid_cols" uid-cols "if_exists" if-exists}]
-          (self._flip_active rank)
+          (self._set_active rank 1)
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
@@ -203,13 +230,12 @@
       win))
 
   ;--
-  (defn _flip_active [self wid]
+  (defn _set_active [self wid val]
     (let [wid (- wid 1)]
+      (sleep (+ 0.001 (np.clip (np.random.normal 0.0 0.001) -0.001 1)))
       (self._win.Lock :rank 0)
       (self._win.Get self._buf :target-rank 0)
-      (self._win.Unlock :rank 0)
-      (setv (get self._buf wid) (if (= (get self._buf wid) 1) 0 1))
-      (self._win.Lock :rank 0)
+      (setv (get self._buf wid) val)
       (self._win.Put self._buf :target-rank 0)
       (self._win.Unlock :rank 0)))
 
@@ -226,14 +252,17 @@
            (self.add-modifier (get data "term") (get data "code"))]
           [(= (get data "task") "extract")
            (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
-               (self._flip_active self._rank))]
+               (self._set_active self._rank 0))]
+          [(= (get data "task") "extract-pandas")
+           (do (self._extract-pandas_staged (get data "pandas") (get data "xcol") (get data "uid_cols"))
+               (self._set_active self._rank 0))]
           [(= (get data "task") "transform")
            (do (unless (is (get data "df") None) (setv self._staged (get data "df")))
                (self._tranform_staged (get data "xcol") (get data "uid_cols"))
-               (self._flip_active self._rank))]
+               (self._set_active self._rank 0))]
           [(= (get data "task") "load")
            (do (self._load_staged (get data "to_table") (get data "if_exists"))
-               (self._flip_active self._rank))]
+               (self._set_active self._rank 0))]
           [(= (get data "task") "gather")
            (let [staged self._staged]
              (setv self._staged None)
@@ -242,19 +271,24 @@
            (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
                (self._tranform_staged (get data "xcol") (get data "uid_cols"))
                (self._load_staged (get data "to_table") (get data "if_exists"))
-               (self._flip_active self._rank))]))))
+               (self._set_active self._rank 0))]))))
 
   ;--
   (defn get-workers [self]
     (if (= self._comm None)
         {0 0}
-        (do (self._win.Lock :rank 0)
+        (do (sleep (+ 0.001 (np.clip (np.random.normal 0.0 0.001) 0 1)))
+            (self._win.Lock :rank 0)
             (self._win.Get self._buf :target-rank 0)
             (self._win.Unlock :rank 0)
             (dfor rank self._workers [rank (get self._buf (- rank 1))]))))
 
   ;--
   (defn barrier [self]
-    (while (let [actives (lfor (, rank active) (.items (self.get-workers)) active)]
-              (> (sum actives) 0))
-      (sleep 0.5))))
+    (let [actives (sum (lfor (, rank active) (.items (self.get-workers)) active))]
+      (while (> actives 1) 
+        (setv actives (sum (lfor (, rank active) (.items (self.get-workers)) active)))))))
+    ;; (self._win.Lock :rank 0)
+    ;; (setv self._buf (np.zeros (len self._workers) :dtype "int8"))
+    ;; (self._win.Put self._buf :target-rank 0)
+    ;; (self._win.Unlock :rank 0)))
