@@ -144,16 +144,16 @@
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
-  (defn _extract-pandas_staged [self pandas xcol uid-cols]
+  (defn _extract-pandas_staged [self inpath xcol uid-cols]
     (setv self._staged
-          (cond [(.endswith pandas ".csv") (get (pd.read-csv pandas) (+ uid-cols [xcol]))]
-                [(.endswith pandas ".parquet") (get (pd.read-parquet pandas) (+ uid-cols [xcol]))])))
+          (cond [(.endswith inpath ".csv") (get (pd.read-csv inpath) (+ uid-cols [xcol]))]
+                [(.endswith inpath ".parquet") (get (pd.read-parquet inpath) (+ uid-cols [xcol]))])))
 
   ;--
-  (defn extract-pandas [self pandas &optional [xcol "text"] [uid-cols ["index"]] [rank 0]]
+  (defn extract-pandas [self inpath &optional [xcol "text"] [uid-cols ["index"]] [rank 0]]
     (if (| (= self._comm None) (= rank 0))
-        (self._extract-pandas_staged pandas xcol uid-cols)
-        (let [data {"task" "extract-pandas" "pandas" pandas "xcol" xcol "uid_cols" uid-cols}]
+        (self._extract-pandas_staged inpath xcol uid-cols)
+        (let [data {"task" "extract_pandas" "inpath" inpath "xcol" xcol "uid_cols" uid-cols}]
           (self._set_active rank 1)
           (self._comm.send data :dest rank :tag 11))))
 
@@ -199,6 +199,21 @@
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
+  (defn _load-pandas_staged [self outpath]
+    (when (is self._staged None) (raise "nile: load: No DataFrame has been staged."))
+    (cond [(.endswith outpath ".csv") (.to-csv self._staged outpath :index False)]
+          [(.endswith outpath ".parquet") (.to-csv self._staged outpath :index False)])
+    (setv self._staged None))
+
+  ;--
+  (defn load-pandas [self outpath &optional [rank 0]]
+    (if (| (= self._comm None) (= rank 0))
+        (self._load-pandas_staged to_table if-exists)
+        (let [data {"task" "load_pandas" "outpath" outpath}]
+          (self._set_active rank 1)
+          (self._comm.send data :dest rank :tag 11))))
+
+  ;--
   (defn gather [self &optional [rank 0]]
     (if (| (= self._comm None) (= rank 0))
         (let [staged self._staged]
@@ -219,6 +234,16 @@
           (self._comm.send data :dest rank :tag 11))))
 
   ;--
+  (defn etl-pandas [self inpath outpath &optional [xcol "text"] [uid-cols ["index"]] [rank 0]]
+    (if (| (= self._comm None) (= rank 0))
+        (do (self._extract-pandas_staged inpath xcol uid-cols)
+            (self._tranform_staged xcol uid-cols)
+            (self._load-pandas_staged outpath))
+        (let [data {"task" "etl_pandas" "inpath" inpath "outpath" outpath "xcol" xcol "uid_cols" uid-cols}]
+          (self._set_active rank 1)
+          (self._comm.send data :dest rank :tag 11))))
+
+  ;--
   (defn _init_win [self]
     (let [size (* (len self._workers) (MPI.CHAR.Get_size))
           win (MPI.Win.Allocate size :comm self._comm)]
@@ -232,7 +257,6 @@
   ;--
   (defn _set_active [self wid val]
     (let [wid (- wid 1)]
-      (sleep (+ 0.001 (np.clip (np.random.normal 0.0 0.001) -0.001 1)))
       (self._win.Lock :rank 0)
       (self._win.Get self._buf :target-rank 0)
       (setv (get self._buf wid) val)
@@ -253,8 +277,8 @@
           [(= (get data "task") "extract")
            (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
                (self._set_active self._rank 0))]
-          [(= (get data "task") "extract-pandas")
-           (do (self._extract-pandas_staged (get data "pandas") (get data "xcol") (get data "uid_cols"))
+          [(= (get data "task") "extract_pandas")
+           (do (self._extract-pandas_staged (get data "inpath") (get data "xcol") (get data "uid_cols"))
                (self._set_active self._rank 0))]
           [(= (get data "task") "transform")
            (do (unless (is (get data "df") None) (setv self._staged (get data "df")))
@@ -262,6 +286,9 @@
                (self._set_active self._rank 0))]
           [(= (get data "task") "load")
            (do (self._load_staged (get data "to_table") (get data "if_exists"))
+               (self._set_active self._rank 0))]
+          [(= (get data "task") "load_pandas")
+           (do (self._load-pandas_staged (get data "outpath"))
                (self._set_active self._rank 0))]
           [(= (get data "task") "gather")
            (let [staged self._staged]
@@ -271,14 +298,18 @@
            (do (self._extract_staged (get data "query") (get data "xcol") (get data "uid_cols"))
                (self._tranform_staged (get data "xcol") (get data "uid_cols"))
                (self._load_staged (get data "to_table") (get data "if_exists"))
+               (self._set_active self._rank 0))]
+          [(= (get data "task") "etl_pandas")
+           (do (self._extract-pandas_staged (get data "inpath") (get data "xcol") (get data "uid_cols"))
+               (self._tranform_staged (get data "xcol") (get data "uid_cols"))
+               (self._load-pandas_staged (get data "outpath"))
                (self._set_active self._rank 0))]))))
 
   ;--
   (defn get-workers [self]
     (if (= self._comm None)
         {0 0}
-        (do (sleep (+ 0.001 (np.clip (np.random.normal 0.0 0.001) 0 1)))
-            (self._win.Lock :rank 0)
+        (do (self._win.Lock :rank 0)
             (self._win.Get self._buf :target-rank 0)
             (self._win.Unlock :rank 0)
             (dfor rank self._workers [rank (get self._buf (- rank 1))]))))
